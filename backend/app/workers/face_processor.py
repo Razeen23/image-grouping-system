@@ -14,7 +14,22 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-async def process_image(image_id: UUID) -> dict:
+def process_image_sync(image_id: UUID) -> dict:
+    """
+    Process an image: detect faces, extract embeddings, and assign to groups.
+    This is the main entry point used by FastAPI BackgroundTasks.
+    
+    Args:
+        image_id: Image ID to process
+    
+    Returns:
+        Dictionary with processing results
+    """
+    # Since all operations are synchronous, we don't need async
+    return _process_image_internal(image_id)
+
+
+def _process_image_internal(image_id: UUID) -> dict:
     """
     Process an image: detect faces, extract embeddings, and assign to groups.
     
@@ -28,7 +43,7 @@ async def process_image(image_id: UUID) -> dict:
     db = SessionLocal()
     image = None
     try:
-        logger.info(f"Starting processing for image {image_id}")
+        logger.info(f"🚀 Starting processing for image {image_id}")
         
         # Get image
         image = db.query(Image).filter(Image.id == image_id).first()
@@ -90,13 +105,23 @@ async def process_image(image_id: UUID) -> dict:
         # Detect all faces
         try:
             logger.info(f"Detecting faces in image {image_id}")
+            logger.info(f"Image array info: shape={image_array.shape}, dtype={image_array.dtype}, min={image_array.min()}, max={image_array.max()}")
             face_detections = face_detector.detect_faces(image_array)
             if len(face_detections) == 0:
-                logger.warning(f"No faces detected in image {image_id}")
+                logger.warning(f"❌ No faces detected in image {image_id} (filename: {image.filename})")
+                logger.warning(f"   Image dimensions: {image.width}x{image.height}")
+                logger.warning(f"   Image type: {image.mime_type}")
+                logger.warning(f"   This could mean:")
+                logger.warning(f"   - Face is occluded (sunglasses, mask, etc.)")
+                logger.warning(f"   - Face is too small or at extreme angle")
+                logger.warning(f"   - Detection threshold is too high")
+                logger.warning(f"   - Image quality issues")
             else:
-                logger.info(f"Detected {len(face_detections)} faces in image {image_id}")
+                logger.info(f"✅ Detected {len(face_detections)} faces in image {image_id}")
+                for idx, det in enumerate(face_detections):
+                    logger.info(f"   Face {idx + 1}: confidence={det.confidence:.4f}, bbox={det.bbox}")
         except Exception as e:
-            logger.error(f"Face detection failed for image {image_id}: {e}")
+            logger.error(f"Face detection failed for image {image_id}: {e}", exc_info=True)
             raise
         
         results = {
@@ -106,16 +131,32 @@ async def process_image(image_id: UUID) -> dict:
         }
         
         # Process each face
+        faces_processed = 0
+        faces_skipped = 0
         for idx, detection in enumerate(face_detections):
             try:
                 logger.info(f"Processing face {idx + 1}/{len(face_detections)} in image {image_id}")
+                logger.info(f"  Face bbox: {detection.bbox}, confidence: {detection.confidence}")
                 
-                # Extract embedding
+                # Check if face_object is available
+                face_object = getattr(detection, 'face_object', None)
+                if face_object is not None:
+                    logger.info(f"  Face object available, will use pre-computed embedding")
+                else:
+                    logger.warning(f"  Face object not available, will use fallback extraction from cropped image")
+                
+                # Extract embedding (use face_object if available, otherwise fallback to cropped image)
                 try:
-                    embedding = face_detector.extract_embedding(detection.cropped_image)
-                    logger.debug(f"Extracted embedding for face {idx + 1} in image {image_id}, shape: {embedding.shape}")
+                    embedding = face_detector.extract_embedding(
+                        face_image=detection.cropped_image,
+                        face_object=face_object
+                    )
+                    logger.info(f"✅ Extracted embedding for face {idx + 1} in image {image_id}, shape: {embedding.shape}")
                 except Exception as e:
-                    logger.warning(f"Failed to extract embedding for face {idx + 1} in image {image_id}: {e}")
+                    logger.error(f"❌ Failed to extract embedding for face {idx + 1} in image {image_id}: {e}", exc_info=True)
+                    logger.error(f"   Error type: {type(e).__name__}")
+                    logger.error(f"   Cropped image shape: {detection.cropped_image.shape if hasattr(detection, 'cropped_image') else 'N/A'}")
+                    faces_skipped += 1
                     continue  # Skip this face but continue with others
                 
                 # Find matching group
@@ -159,9 +200,10 @@ async def process_image(image_id: UUID) -> dict:
                     )
                     db.add(face_record)
                     db.flush()  # Flush to get face ID
-                    logger.debug(f"Created face record {face_record.id} for face {idx + 1} in image {image_id}")
+                    logger.info(f"✅ Created face record {face_record.id} for face {idx + 1} in image {image_id}")
+                    faces_processed += 1
                 except Exception as e:
-                    logger.error(f"Failed to save face record for face {idx + 1} in image {image_id}: {e}")
+                    logger.error(f"❌ Failed to save face record for face {idx + 1} in image {image_id}: {e}", exc_info=True)
                     raise
                 
                 # If this is a new group, set this face as representative
@@ -194,6 +236,16 @@ async def process_image(image_id: UUID) -> dict:
                 # Continue with next face
                 continue
         
+        # Log processing summary
+        logger.info(f"Face processing summary for image {image_id}:")
+        logger.info(f"  Total faces detected: {len(face_detections)}")
+        logger.info(f"  Faces successfully processed: {faces_processed}")
+        logger.info(f"  Faces skipped (embedding failed): {faces_skipped}")
+        
+        if faces_processed == 0 and len(face_detections) > 0:
+            logger.error(f"⚠️ WARNING: {len(face_detections)} faces detected but NONE were processed successfully!")
+            logger.error(f"   All faces failed during embedding extraction. Check logs above for details.")
+        
         # Ensure all pending changes are flushed before final commit
         try:
             db.flush()
@@ -210,7 +262,7 @@ async def process_image(image_id: UUID) -> dict:
         try:
             db.commit()
             logger.info(f"Committed database changes for image {image_id}")
-            logger.info(f"Successfully processed image {image_id}: {results['faces_detected']} faces, {len(results['groups_matched'])} matched, {len(results['groups_created'])} created")
+            logger.info(f"Successfully processed image {image_id}: {results['faces_detected']} faces detected, {faces_processed} faces saved, {len(results['groups_matched'])} matched, {len(results['groups_created'])} created")
             if results['groups_created']:
                 logger.info(f"Created person groups for image {image_id}: {', '.join(results['groups_created'])}")
             if results['groups_matched']:
@@ -235,3 +287,8 @@ async def process_image(image_id: UUID) -> dict:
     finally:
         db.close()
         logger.debug(f"Closed database session for image {image_id}")
+
+
+# Alias for backward compatibility
+process_image = process_image_sync
+process_image_async = process_image_sync  # Keep for any existing references

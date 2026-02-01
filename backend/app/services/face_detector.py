@@ -1,7 +1,7 @@
 """Face detection and embedding service using InsightFace."""
 import cv2
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 from dataclasses import dataclass
 from app.config import settings
 
@@ -13,6 +13,7 @@ class FaceDetection:
     confidence: float
     cropped_image: np.ndarray
     landmarks: Optional[np.ndarray] = None
+    face_object: Optional[Any] = None  # Store the original InsightFace face object for embedding extraction
 
 
 class FaceDetector:
@@ -33,13 +34,23 @@ class FaceDetector:
             # Larger det_size helps with smaller or occluded faces
             # Lower threshold helps with faces that have sunglasses or partial occlusions
             try:
-                # Try with lower threshold (some InsightFace versions support this)
-                self.model.prepare(ctx_id=0, det_size=(832, 832), det_thresh=0.3)
-                logger.info("Face detector initialized with det_size=(832,832) and det_thresh=0.3")
+                # Try with very low threshold (0.2) for difficult cases like sunglasses
+                # Some InsightFace versions support det_thresh parameter
+                self.model.prepare(ctx_id=0, det_size=(832, 832), det_thresh=0.2)
+                logger.info("Face detector initialized with det_size=(832,832) and det_thresh=0.2 (very sensitive)")
             except TypeError:
-                # If det_thresh parameter not supported, just use larger detection size
-                self.model.prepare(ctx_id=0, det_size=(832, 832))
-                logger.info("Face detector initialized with det_size=(832,832) - using default threshold")
+                # If det_thresh parameter not supported, try setting it on the detector model
+                try:
+                    # Some versions require setting threshold on the detector directly
+                    if hasattr(self.model, 'det_model') and hasattr(self.model.det_model, 'threshold'):
+                        self.model.det_model.threshold = 0.2
+                        logger.info("Set detection threshold to 0.2 on det_model")
+                    self.model.prepare(ctx_id=0, det_size=(832, 832))
+                    logger.info("Face detector initialized with det_size=(832,832) - threshold may be set separately")
+                except Exception as e2:
+                    logger.warning(f"Could not set threshold separately: {e2}")
+                    self.model.prepare(ctx_id=0, det_size=(832, 832))
+                    logger.info("Face detector initialized with det_size=(832,832) - using default threshold")
             except Exception as e:
                 # Fallback to default if anything else fails
                 logger.warning(f"Could not set custom detection parameters: {e}, using defaults")
@@ -66,19 +77,32 @@ class FaceDetector:
             image_rgb = image
         
         # Detect faces
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        logger.info(f"Running face detection on image: shape={image_rgb.shape}, dtype={image_rgb.dtype}")
         faces = self.model.get(image_rgb)
         
         # Log detection results for debugging
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.debug(f"InsightFace detected {len(faces)} raw face detections")
+        logger.info(f"InsightFace detected {len(faces)} raw face detections")
+        
+        if len(faces) == 0:
+            logger.warning("No faces detected by InsightFace model. This could be due to:")
+            logger.warning("  - Face not clearly visible")
+            logger.warning("  - Face occluded (sunglasses, mask, etc.)")
+            logger.warning("  - Face too small or at extreme angle")
+            logger.warning("  - Image quality issues")
+            logger.warning(f"  - Detection threshold too high (current: det_thresh=0.3)")
         
         detections = []
         for idx, face in enumerate(faces):
             # Log confidence score for debugging
             confidence = getattr(face, 'det_score', None)
-            if confidence is not None:
-                logger.debug(f"Face {idx + 1}: confidence={confidence:.4f}, bbox={face.bbox}")
+            bbox = face.bbox if hasattr(face, 'bbox') else None
+            if confidence is not None and bbox is not None:
+                logger.info(f"Face {idx + 1}: confidence={confidence:.4f}, bbox={bbox}")
+            else:
+                logger.warning(f"Face {idx + 1}: missing confidence or bbox attributes")
             # Get bounding box
             bbox = face.bbox.astype(int)
             x1, y1, x2, y2 = bbox
@@ -96,7 +120,7 @@ class FaceDetector:
             
             # Skip if bbox is too small
             if bbox_width < 20 or bbox_height < 20:
-                logger.debug(f"Skipping face {idx + 1}: bbox too small ({bbox_width}x{bbox_height})")
+                logger.warning(f"Skipping face {idx + 1}: bbox too small ({bbox_width}x{bbox_height}) - minimum is 20x20")
                 continue
             
             # Crop face region (with some padding)
@@ -115,17 +139,83 @@ class FaceDetector:
                 bbox=(x1, y1, bbox_width, bbox_height),
                 confidence=face.det_score,
                 cropped_image=cropped,
-                landmarks=landmarks
+                landmarks=landmarks,
+                face_object=face  # Store the original face object for embedding extraction
             )
             detections.append(detection)
-            logger.debug(f"Added face detection {len(detections)}: confidence={face.det_score:.4f}, size={bbox_width}x{bbox_height}")
+            logger.info(f"✅ Added face detection {len(detections)}: confidence={face.det_score:.4f}, size={bbox_width}x{bbox_height}, position=({x1},{y1})")
         
-        logger.info(f"Returning {len(detections)} face detections after filtering")
+        if len(detections) == 0 and len(faces) > 0:
+            logger.warning(f"⚠️ All {len(faces)} detected faces were filtered out (too small or invalid)")
+        elif len(detections) == 0:
+            logger.warning("⚠️ No face detections returned - InsightFace found 0 faces in the image")
+        
+        logger.info(f"Returning {len(detections)} face detections after filtering (from {len(faces)} raw detections)")
         return detections
     
-    def extract_embedding(self, face_image: np.ndarray) -> np.ndarray:
+    def extract_embedding(self, face_image: np.ndarray = None, face_object: Any = None) -> np.ndarray:
         """
-        Extract face embedding from cropped face image.
+        Extract face embedding from either a face object or cropped face image.
+        
+        Args:
+            face_image: Cropped face image as numpy array (optional if face_object is provided)
+            face_object: Original InsightFace face object (preferred, contains embedding already)
+        
+        Returns:
+            512-dimensional embedding vector
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # If we have the original face object, use its embedding directly
+        if face_object is not None:
+            logger.debug(f"Extracting embedding from face_object (type: {type(face_object).__name__})")
+            # Try different attribute names for embedding
+            if hasattr(face_object, 'norm_embeddings'):
+                logger.debug("Using norm_embeddings attribute")
+                embedding = face_object.norm_embeddings
+            elif hasattr(face_object, 'embedding_norm'):
+                logger.debug("Using embedding_norm attribute")
+                embedding = face_object.embedding_norm
+            elif hasattr(face_object, 'embedding'):
+                logger.debug("Using embedding attribute")
+                embedding = face_object.embedding
+            else:
+                # Log available attributes for debugging
+                attrs = [attr for attr in dir(face_object) if not attr.startswith('_')]
+                logger.warning(f"Face object has no embedding attribute. Available attributes: {attrs[:10]}...")
+                # Fallback to re-detection if embedding not available
+                if face_image is None:
+                    raise ValueError("Face object has no embedding and face_image not provided")
+                logger.info("Falling back to re-detection from cropped image")
+                return self._extract_embedding_from_image(face_image)
+        elif face_image is not None:
+            # Fallback to re-detection if no face object provided
+            logger.info("No face_object provided, using re-detection from cropped image")
+            return self._extract_embedding_from_image(face_image)
+        else:
+            raise ValueError("Either face_object or face_image must be provided")
+        
+        # Ensure it's a numpy array and has correct shape
+        if not isinstance(embedding, np.ndarray):
+            embedding = np.array(embedding)
+        
+        # Flatten if needed
+        if len(embedding.shape) > 1:
+            embedding = embedding.flatten()
+        
+        # Normalize to unit vector (ensure it's normalized)
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+        else:
+            raise ValueError("Embedding has zero norm")
+        
+        return embedding.astype(np.float32)
+    
+    def _extract_embedding_from_image(self, face_image: np.ndarray) -> np.ndarray:
+        """
+        Extract face embedding from cropped face image (fallback method).
         
         Args:
             face_image: Cropped face image as numpy array

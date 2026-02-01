@@ -99,6 +99,8 @@ alembic upgrade head
 
 # Start server
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+#or
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### 3. MinIO Setup

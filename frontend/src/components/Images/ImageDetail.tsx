@@ -8,22 +8,100 @@ export default function ImageDetail() {
 
   const { data: image, isLoading: imageLoading } = useQuery({
     queryKey: ['image', imageId],
-    queryFn: () => imagesApi.get(imageId!),
+    queryFn: () => {
+      console.log('📸 Fetching image details for:', imageId);
+      return imagesApi.get(imageId!);
+    },
     enabled: !!imageId,
+    refetchInterval: (query) => {
+      // Poll for status updates if image is processing
+      const data = query.state.data as any;
+      if (data?.processing_status === 'processing' || data?.processing_status === 'pending') {
+        return 2000; // Poll every 2 seconds while processing
+      }
+      return false; // Don't poll if completed or failed
+    },
+    onSuccess: (data) => {
+      console.log('✅ Image loaded:', {
+        id: data.id,
+        filename: data.filename,
+        status: data.processing_status,
+        processed_at: data.processed_at,
+      });
+      if (data.processing_status === 'processing') {
+        console.log('⏳ Image is currently being processed...');
+      } else if (data.processing_status === 'completed') {
+        console.log('✅ Image processing completed');
+      } else if (data.processing_status === 'failed') {
+        console.error('❌ Image processing failed');
+      }
+    },
   });
 
   const { data: faces, isLoading: facesLoading } = useQuery({
     queryKey: ['image-faces', imageId],
-    queryFn: () => imagesApi.getFaces(imageId!),
+    queryFn: () => {
+      console.log('👤 Fetching faces for image:', imageId);
+      return imagesApi.getFaces(imageId!);
+    },
     enabled: !!imageId,
+    onSuccess: (data) => {
+      console.log('✅ Faces loaded:', {
+        count: data.length,
+        faces: data.map(f => ({
+          id: f.id,
+          confidence: f.confidence,
+          person_group_id: f.person_group_id,
+        })),
+      });
+      if (data.length === 0) {
+        console.warn('⚠️ No faces detected in this image');
+      }
+    },
   });
 
   const retryMutation = useMutation({
-    mutationFn: () => imagesApi.retryProcessing(imageId!),
-    onSuccess: () => {
+    mutationFn: () => {
+      console.log('🔄 Starting face detection retry for image:', imageId);
+      return imagesApi.retryProcessing(imageId!);
+    },
+    onSuccess: (data) => {
+      console.log('✅ Retry initiated:', data);
       // Refetch image data to get updated status
       queryClient.invalidateQueries({ queryKey: ['image', imageId] });
       queryClient.invalidateQueries({ queryKey: ['images'] });
+      queryClient.invalidateQueries({ queryKey: ['image-faces', imageId] });
+      queryClient.invalidateQueries({ queryKey: ['groups'] });
+      console.log('🔄 Queries invalidated, will refetch data...');
+    },
+    onError: (error) => {
+      console.error('❌ Retry failed:', error);
+    },
+  });
+
+  const debugMutation = useMutation({
+    mutationFn: () => {
+      console.log('🔍 Running detection debug test for image:', imageId);
+      return imagesApi.getDetectionDebug(imageId!);
+    },
+    onSuccess: (data) => {
+      console.log('🔍 Detection Debug Results:', data);
+      if (data.detection_results) {
+        console.log(`   Faces detected: ${data.detection_results.faces_detected}`);
+        if (data.detection_results.detections && data.detection_results.detections.length > 0) {
+          data.detection_results.detections.forEach((det: any, idx: number) => {
+            console.log(`   Face ${idx + 1}: confidence=${det.confidence.toFixed(4)}, bbox=${det.bbox}, size=${det.bbox_size}`);
+          });
+        } else {
+          console.warn('   ⚠️ No faces detected in debug test');
+        }
+      }
+      if (data.error) {
+        console.error('   ❌ Debug test error:', data.error);
+      }
+    },
+    onError: (error) => {
+      console.error('❌ Debug test failed:', error);
     },
   });
 
@@ -91,6 +169,26 @@ export default function ImageDetail() {
                 {retryMutation.isPending ? 'Retrying...' : 'Retry Processing'}
               </button>
             )}
+            {image.processing_status === 'completed' && (
+              <>
+                <button
+                  onClick={() => retryMutation.mutate()}
+                  disabled={retryMutation.isPending}
+                  className="px-3 py-1 bg-green-600 text-white text-sm rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Redo face detection with improved settings"
+                >
+                  {retryMutation.isPending ? 'Redetecting...' : 'Redo Face Detection'}
+                </button>
+                <button
+                  onClick={() => debugMutation.mutate()}
+                  disabled={debugMutation.isPending}
+                  className="px-3 py-1 bg-purple-600 text-white text-sm rounded hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Test face detection and see detailed results in console"
+                >
+                  {debugMutation.isPending ? 'Testing...' : '🔍 Test Detection'}
+                </button>
+              </>
+            )}
           </div>
 
           {image.processing_status === 'completed' && (
@@ -126,6 +224,25 @@ export default function ImageDetail() {
                     <strong>Note:</strong> Person groups are only created when faces are detected. 
                     If no faces are detected in any images, you won't see any person groups on the People page.
                   </p>
+                  <button
+                    onClick={() => retryMutation.mutate()}
+                    disabled={retryMutation.isPending}
+                    className="mt-3 px-4 py-2 bg-green-600 text-white text-sm rounded hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {retryMutation.isPending ? 'Redetecting Faces...' : '🔄 Redo Face Detection'}
+                  </button>
+                </div>
+              )}
+              {faces && faces.length > 0 && (
+                <div className="mt-3">
+                  <button
+                    onClick={() => retryMutation.mutate()}
+                    disabled={retryMutation.isPending}
+                    className="px-4 py-2 bg-gray-600 text-white text-sm rounded hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Reprocess this image to detect faces again (existing faces will be removed)"
+                  >
+                    {retryMutation.isPending ? 'Redetecting...' : '🔄 Redo Face Detection'}
+                  </button>
                 </div>
               )}
             </div>

@@ -6,7 +6,22 @@ import { Link } from 'react-router-dom';
 export default function PeopleGrid() {
   const { data: groups, isLoading, error } = useQuery({
     queryKey: ['groups'],
-    queryFn: () => groupsApi.list(0, 100),
+    queryFn: () => {
+      console.log('👥 Fetching person groups...');
+      return groupsApi.list(0, 100);
+    },
+    onSuccess: (data) => {
+      console.log('✅ Person groups loaded:', {
+        count: data.length,
+        groups: data.map(g => ({ id: g.id, name: g.name })),
+      });
+      if (data.length === 0) {
+        console.warn('⚠️ No person groups found. This usually means no faces were detected in any images.');
+      }
+    },
+    onError: (err) => {
+      console.error('❌ Error loading person groups:', err);
+    },
   });
 
   if (isLoading) {

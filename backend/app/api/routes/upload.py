@@ -9,7 +9,7 @@ from app.models import Image
 from app.schemas.upload import UploadResponse
 from app.services.storage import storage_service
 from app.services.image_processor import image_processor
-from app.workers.face_processor import process_image
+from app.workers.face_processor import process_image_sync
 from app.config import settings
 
 router = APIRouter(prefix="/api/upload", tags=["upload"])
@@ -69,7 +69,7 @@ async def upload_images(
             
             # Trigger background processing if enabled
             if settings.ENABLE_AUTO_PROCESSING and background_tasks:
-                background_tasks.add_task(process_image, image.id)
+                background_tasks.add_task(process_image_sync, image.id)
             
             responses.append(UploadResponse(
                 image_id=image.id,

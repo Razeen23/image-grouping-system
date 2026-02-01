@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from uuid import UUID
 from app.database import get_db
 from app.models import Image
-from app.workers.face_processor import process_image
+from app.workers.face_processor import process_image_sync
 
 router = APIRouter(prefix="/api/process", tags=["processing"])
 
@@ -21,7 +21,7 @@ async def trigger_processing(
         raise HTTPException(status_code=404, detail="Image not found")
     
     # Add background task
-    background_tasks.add_task(process_image, image_id)
+    background_tasks.add_task(process_image_sync, image_id)
     
     return {"message": "Processing started", "image_id": str(image_id)}
 
